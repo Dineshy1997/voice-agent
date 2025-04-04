@@ -8,32 +8,64 @@ import pandas as pd
 from gtts import gTTS
 import tempfile
 from pathlib import Path
+import pyaudio
+import wave
 import json
 import google.generativeai as genai
-from streamlit_webrtc import webrtc_streamer, WebRtcMode
-import av
-import queue
-import threading
-import io
 
-# Configure API key
+# List of API keys to rotate through
+API_KEYS = [
+    "AIzaSyA4XoQocx6O7ffw413LfZkUjd6cFrLozuE",
+    "AIzaSyAs3xtBgM9jogT_oxKjPPupi96YY4RtyGo",  # Replace with your second API key
+    "AIzaSyBtqE7KUn0hwunNHMhxqTDpd074e3n5DxQ",  # Replace with your third API key
+    "AIzaSyBmlRXXXCLIQMPfWel_xVbV_qpSHd1tED8",  # Replace with your fourth API key
+    "AIzaSyBSpZFh5zw5muWJUAWPJb404OljN1eTTnU",  # Replace with your fifth API key
+    "AIzaSyCyf9I53pIjv2vokunrGrB_zbMCnGCopnI",  # Replace with your sixth API key
+]
+
+# Global variable to track the current API key index
+if 'current_api_key_index' not in st.session_state:
+    st.session_state.current_api_key_index = 0
+
+# Configure API key with rotation logic
 def configure_gemini_api():
-    # Directly use your Gemini API key
-    api_key = "AIzaSyAtru-mkkcFaB0iUj_mUieqSs-p5ArAMpME"
-    genai.configure(api_key=api_key)
-    return genai
+    global API_KEYS
+    api_key = API_KEYS[st.session_state.current_api_key_index]
+    try:
+        genai.configure(api_key=api_key)
+        return genai
+    except Exception as e:
+        st.error(f"Failed to configure API key {api_key}: {str(e)}")
+        # Move to the next API key if there's an issue
+        switch_to_next_api_key()
+        return configure_gemini_api()  # Recursive call with next key
 
-# Initialize Gemini model
+# Switch to the next API key in the list
+def switch_to_next_api_key():
+    st.session_state.current_api_key_index = (st.session_state.current_api_key_index + 1) % len(API_KEYS)
+    st.warning(f"Switched to API key index {st.session_state.current_api_key_index}")
+
+# Initialize Gemini model with retry logic
 def initialize_gemini():
-    gemini = configure_gemini_api()
-    # Using gemini-1.5-pro instead of gemini-pro as it might be the newer version required
-    model = genai.GenerativeModel('gemini-1.5-pro')
-    return model
+    max_attempts = len(API_KEYS)
+    attempts = 0
+    
+    while attempts < max_attempts:
+        try:
+            gemini = configure_gemini_api()
+            model = gemini.GenerativeModel('gemini-1.5-pro')
+            return model
+        except Exception as e:
+            st.error(f"Failed to initialize Gemini with API key {st.session_state.current_api_key_index}: {str(e)}")
+            switch_to_next_api_key()
+            attempts += 1
+    
+    st.error("All API keys failed to initialize Gemini. Proceeding with limited functionality.")
+    return None  # Return None if all keys fail
 
-# System database simulation (in production, use a proper database)
+# System database simulation (unchanged)
 class RecordingsDatabase:
     def __init__(self):
-        # Initialize database or load from file
         self.db_file = "voice_recordings.json"
         if os.path.exists(self.db_file):
             with open(self.db_file, 'r') as f:
@@ -59,22 +91,51 @@ class RecordingsDatabase:
         
         self.records[user_id].append(record)
         
-        # Save to file
         with open(self.db_file, 'w') as f:
             json.dump(self.records, f)
             
     def get_user_recordings(self, user_id):
-        if user_id in self.records:
-            return self.records[user_id]
-        return []
+        return self.records.get(user_id, [])
 
-# Function to transcribe and translate using Gemini
-def transcribe_and_translate(model, audio_data, source_language="auto", target_language="English"):
-    # For Gemini, we need to encode the audio file
+# Record audio function (unchanged)
+def record_audio(duration=10, sample_rate=44100):
+    st.write("🔴 Recording...")
+    progress_bar = st.progress(0)
+    p = pyaudio.PyAudio()
+    stream = p.open(format=pyaudio.paInt16, channels=1, rate=sample_rate, input=True, frames_per_buffer=1024)
+    frames = []
+    
+    for i in range(0, int(sample_rate / 1024 * duration)):
+        data = stream.read(1024)
+        frames.append(data)
+        progress_bar.progress((i + 1) / int(sample_rate / 1024 * duration))
+        time.sleep(0.001)
+    
+    stream.stop_stream()
+    stream.close()
+    p.terminate()
+    
+    filename = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+    os.makedirs(os.path.dirname(filename), exist_ok=True)
+    
+    wf = wave.open(filename, 'wb')
+    wf.setnchannels(1)
+    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
+    wf.setframerate(sample_rate)
+    wf.writeframes(b''.join(frames))
+    wf.close()
+    
+    st.success(f"Recording saved: {filename}")
+    return filename
+
+# Transcription and translation with retry logic
+def transcribe_and_translate(model, audio_file, source_language="auto", target_language="English"):
+    with open(audio_file, "rb") as f:
+        audio_data = f.read()
+    
     import base64
     audio_b64 = base64.b64encode(audio_data).decode()
     
-    # Request Gemini to transcribe
     prompt_transcribe = f"""
     Please transcribe this audio file accurately.
     The language may be {source_language} or could be any language if auto-detected.
@@ -88,11 +149,13 @@ def transcribe_and_translate(model, audio_data, source_language="auto", target_l
         ])
         transcript = response.text
     except Exception as e:
-        st.error(f"Transcription error: {str(e)}")
-        # Provide dummy transcript for testing if API fails
-        transcript = "This is a sample transcript. The API failed with: " + str(e)
-    
-    # Step 2: Translate to the target language
+        st.error(f"Transcription failed with API key {st.session_state.current_api_key_index}: {str(e)}")
+        switch_to_next_api_key()
+        model = initialize_gemini()  # Re-initialize with the next key
+        if model:
+            return transcribe_and_translate(model, audio_file, source_language, target_language)
+        transcript = "Transcription failed after all API retries."
+
     prompt_translate = f"""
     Translate the following text to {target_language}.
     Provide only the direct translation without any explanations, notes, or additional context.
@@ -104,12 +167,16 @@ def transcribe_and_translate(model, audio_data, source_language="auto", target_l
         translation_response = model.generate_content(prompt_translate)
         translation = translation_response.text
     except Exception as e:
-        st.error(f"Translation error: {str(e)}")
-        translation = transcript  # Use transcript as fallback
+        st.error(f"Translation failed with API key {st.session_state.current_api_key_index}: {str(e)}")
+        switch_to_next_api_key()
+        model = initialize_gemini()
+        if model:
+            return transcribe_and_translate(model, audio_file, source_language, target_language)
+        translation = transcript  # Fallback to transcript
     
     return transcript, translation
 
-# Function to generate content summary using Gemini
+# Generate content summary (unchanged except for retry logic)
 def generate_content_summary(model, translation):
     prompt = f"""
     Based on the following transcript, create a concise summary that captures the main points.
@@ -119,323 +186,122 @@ def generate_content_summary(model, translation):
     
     try:
         response = model.generate_content(prompt)
-        summary = response.text
-        return summary
+        return response.text
     except Exception as e:
-        st.error(f"Summary generation error: {str(e)}")
-        return "Unable to generate summary due to API error: " + str(e)
+        st.error(f"Summary generation failed with API key {st.session_state.current_api_key_index}: {str(e)}")
+        switch_to_next_api_key()
+        model = initialize_gemini()
+        if model:
+            return generate_content_summary(model, translation)
+        return "Unable to generate summary due to API error."
 
-# Function to generate text-to-speech audio
+# Text-to-speech function (unchanged)
 def text_to_speech(text, language='en'):
+    language_map = {
+        'English': 'en', 'Spanish': 'es', 'French': 'fr', 'Chinese': 'zh-CN',
+        'Arabic': 'ar', 'Hindi': 'hi', 'Japanese': 'ja', 'German': 'de',
+        'Portuguese': 'pt', 'Russian': 'ru'
+    }
+    lang_code = language_map.get(language, 'en')
+    
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
+    audio_file_path = temp_file.name
+    temp_file.close()
+    
     try:
-        # Map language names to language codes for gTTS
-        language_map = {
-            'English': 'en',
-            'Spanish': 'es',
-            'French': 'fr',
-            'Chinese': 'zh-CN',
-            'Arabic': 'ar',
-            'Hindi': 'hi',
-            'Japanese': 'ja',
-            'German': 'de',
-            'Portuguese': 'pt',
-            'Russian': 'ru',
-            # Add more languages as needed
-        }
-        
-        # Use the appropriate language code
-        lang_code = language_map.get(language, 'en')
-        
-        # Create a temporary file
-        temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.mp3')
-        audio_file_path = temp_file.name
-        temp_file.close()
-        
-        # Generate the speech
         tts = gTTS(text=text, lang=lang_code, slow=False)
         tts.save(audio_file_path)
-        
         return audio_file_path
-        
     except Exception as e:
         st.error(f"Text-to-speech error: {str(e)}")
         return None
-
-# WebRTC Audio Recorder
-class AudioProcessor:
-    def __init__(self, max_duration=10):
-        self.sample_rate = 16000
-        self.channels = 1
-        self.audio_frames = []
-        self.start_time = None
-        self.max_duration = max_duration
-        self.recording = False
-        self.recorded_audio = None
-        self.file_path = None
-    
-    def start_recording(self):
-        self.audio_frames = []
-        self.start_time = time.time()
-        self.recording = True
-        
-    def stop_recording(self):
-        self.recording = False
-        
-    def save_recording(self):
-        if not self.audio_frames:
-            return None
-            
-        # Convert to numpy array
-        audio_data = np.concatenate(self.audio_frames)
-        
-        # Save to file
-        filename = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-        os.makedirs(os.path.dirname(filename), exist_ok=True)
-        
-        # Write WAV file
-        write(filename, self.sample_rate, audio_data.astype(np.int16))
-        
-        # Save the file path and audio data
-        self.file_path = filename
-        self.recorded_audio = audio_data
-        
-        return filename
-        
-    def process_audio(self, frame):
-        if not self.recording:
-            return frame
-            
-        # Check if max duration reached
-        current_time = time.time()
-        if current_time - self.start_time > self.max_duration:
-            self.stop_recording()
-            return frame
-            
-        # Process audio frame
-        audio_frame = frame.to_ndarray()
-        audio_data = audio_frame.flatten()
-        self.audio_frames.append(audio_data)
-        
-        return frame
 
 # Main Streamlit app
 def main():
     st.title("Cube AI Voice Assistant")
     
-    # Initialize database
     db = RecordingsDatabase()
-    
-    # Initialize session state for recording data
     if 'recorded_data' not in st.session_state:
         st.session_state.recorded_data = None
     
-    if 'audio_processor' not in st.session_state:
-        st.session_state.audio_processor = AudioProcessor()
+    model = initialize_gemini()
     
-    # Try to initialize Gemini with error handling
-    try:
-        model = initialize_gemini()
-    except Exception as e:
-        st.error(f"Failed to initialize Gemini API: {str(e)}")
-        st.warning("Proceeding with limited functionality. API features will be simulated.")
-        model = None  # Will use fallback behavior
-    
-    # Sidebar for navigation
     st.sidebar.title("Navigation")
     page = st.sidebar.radio("Go to", ["Voice Recorder", "My Recordings", "Settings"])
     
     if page == "Voice Recorder":
         st.header("Voice Recorder")
         
-        # Input fields in columns
         col1, col2 = st.columns(2)
         with col1:
             user_id = st.text_input("User ID", key="user_id_input")
         with col2:
             source_language = st.selectbox("Source Language (if known)", 
-                                      ["auto", "English", "Spanish", "French", "Chinese", "Arabic", 
-                                       "Hindi", "Japanese", "German", "Portuguese", "Russian"],
-                                      key="source_language_select")
+                                       ["auto", "English", "Spanish", "French", "Chinese", "Arabic", 
+                                        "Hindi", "Japanese", "German", "Portuguese", "Russian"],
+                                       key="source_language_select")
         
         col3, col4 = st.columns(2)
         with col3:
             target_language = st.selectbox("Target Language", 
-                                      ["English", "Spanish", "French", "Chinese", "Arabic", 
-                                       "Hindi", "Japanese", "German", "Portuguese", "Russian"],
-                                      key="target_language_select")
+                                       ["English", "Spanish", "French", "Chinese", "Arabic", 
+                                        "Hindi", "Japanese", "German", "Portuguese", "Russian"],
+                                       key="target_language_select")
         with col4:
             duration = st.slider("Recording Duration (seconds)", min_value=5, max_value=60, value=10, key="duration_slider")
         
-        # Tab for recording method selection
-        record_tab, upload_tab = st.tabs(["Record with Microphone", "Upload Audio File"])
-        
-        with record_tab:
-            st.session_state.audio_processor.max_duration = duration
-            
-            # Start/Stop recording buttons
-            col_rec1, col_rec2 = st.columns(2)
-            with col_rec1:
-                if st.button("Start Recording", key="start_rec_button"):
-                    st.session_state.audio_processor.start_recording()
-                    st.session_state["recording"] = True
-                    st.info("🎤 Recording... (Speak now)")
-            
-            with col_rec2:
-                if st.button("Stop Recording", key="stop_rec_button"):
-                    st.session_state.audio_processor.stop_recording()
-                    if st.session_state.get("recording", False):
-                        st.session_state["recording"] = False
-                        recording_file = st.session_state.audio_processor.save_recording()
-                        if recording_file:
-                            st.success(f"Recording saved: {recording_file}")
-                            
-                            # Read audio data for processing
-                            with open(recording_file, "rb") as f:
-                                audio_data = f.read()
-                            
-                            if not user_id:
-                                st.error("Please enter a User ID")
-                            else:
-                                # Store necessary data in session state
-                                st.session_state.recorded_data = {
-                                    "user_id": user_id,
-                                    "recording_file": recording_file,
-                                    "source_language": source_language,
-                                    "target_language": target_language
-                                }
-                                
-                                # Process the recording
-                                with st.spinner("Transcribing and translating..."):
-                                    transcript, translation = transcribe_and_translate(
-                                        model, 
-                                        audio_data, 
-                                        source_language, 
-                                        target_language
-                                    )
-                                    st.session_state.recorded_data["transcript"] = transcript
-                                    st.session_state.recorded_data["translation"] = translation
-                                
-                                # Generate summary
-                                with st.spinner("Generating content summary..."):
-                                    summary = generate_content_summary(model, translation)
-                                    st.session_state.recorded_data["summary"] = summary
-                                
-                                # Generate text-to-speech for the translation
-                                with st.spinner("Generating audio for translation..."):
-                                    translation_audio = text_to_speech(translation, target_language)
-                                    st.session_state.recorded_data["translation_audio"] = translation_audio
-            
-            # WebRTC component for audio capture
-            st.markdown("### Microphone Capture")
-            webrtc_ctx = webrtc_streamer(
-                key="sendonly-audio", 
-                mode=WebRtcMode.SENDONLY,
-                audio_receiver_size=1024,
-                media_stream_constraints={"audio": True},
-            )
-            
-            if webrtc_ctx.audio_receiver:
-                audio_frames = []
-                start_time = time.time()
+        if st.button("Start Recording", key="record_button"):
+            if not user_id:
+                st.error("Please enter a User ID")
+            else:
+                recording_file = record_audio(duration=duration)
+                st.session_state.recorded_data = {
+                    "user_id": user_id,
+                    "recording_file": recording_file,
+                    "source_language": source_language,
+                    "target_language": target_language
+                }
                 
-                while time.time() - start_time < 1:  # Check for 1 second to get audio frames
-                    try:
-                        audio_frames.append(webrtc_ctx.audio_receiver.get_frame())
-                    except queue.Empty:
-                        pass
+                with st.spinner("Transcribing and translating..."):
+                    transcript, translation = transcribe_and_translate(
+                        model, recording_file, source_language, target_language
+                    )
+                    st.session_state.recorded_data["transcript"] = transcript
+                    st.session_state.recorded_data["translation"] = translation
                 
-                if audio_frames and st.session_state.get("recording", False):
-                    for audio_frame in audio_frames:
-                        sound = audio_frame.to_ndarray()
-                        sound = sound.flatten()
-                        st.session_state.audio_processor.audio_frames.append(sound)
+                with st.spinner("Generating content summary..."):
+                    summary = generate_content_summary(model, translation)
+                    st.session_state.recorded_data["summary"] = summary
+                
+                with st.spinner("Generating audio for translation..."):
+                    translation_audio = text_to_speech(translation, target_language)
+                    st.session_state.recorded_data["translation_audio"] = translation_audio
         
-        with upload_tab:
-            # Use File Uploader as an alternative
-            uploaded_file = st.file_uploader("Upload audio file (WAV, MP3)", type=["wav", "mp3"])
-            
-            # Process button
-            if st.button("Process Uploaded Audio", key="process_upload_button") and uploaded_file is not None:
-                if not user_id:
-                    st.error("Please enter a User ID")
-                else:
-                    # Save the uploaded file
-                    recording_file = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-                    os.makedirs(os.path.dirname(recording_file), exist_ok=True)
-                    
-                    # Read the file data
-                    audio_data = uploaded_file.getvalue()
-                    
-                    # Save file
-                    with open(recording_file, "wb") as f:
-                        f.write(audio_data)
-                    
-                    # Store necessary data in session state
-                    st.session_state.recorded_data = {
-                        "user_id": user_id,
-                        "recording_file": recording_file,
-                        "source_language": source_language,
-                        "target_language": target_language
-                    }
-                    
-                    # Process the recording
-                    with st.spinner("Transcribing and translating..."):
-                        transcript, translation = transcribe_and_translate(
-                            model, 
-                            audio_data, 
-                            source_language, 
-                            target_language
-                        )
-                        st.session_state.recorded_data["transcript"] = transcript
-                        st.session_state.recorded_data["translation"] = translation
-                    
-                    # Generate summary
-                    with st.spinner("Generating content summary..."):
-                        summary = generate_content_summary(model, translation)
-                        st.session_state.recorded_data["summary"] = summary
-                    
-                    # Generate text-to-speech for the translation
-                    with st.spinner("Generating audio for translation..."):
-                        translation_audio = text_to_speech(translation, target_language)
-                        st.session_state.recorded_data["translation_audio"] = translation_audio
-        
-        # Display recorded data if available in simplified two-column layout
         if st.session_state.get('recorded_data'):
             st.subheader("Translation Results")
-            
             col1, col2 = st.columns(2)
-            
             with col1:
                 st.markdown("**Original:**")
                 st.write(st.session_state.recorded_data["transcript"])
                 st.audio(st.session_state.recorded_data["recording_file"])
-            
             with col2:
                 st.markdown("**Translation:**")
                 st.write(st.session_state.recorded_data["translation"])
                 if st.session_state.recorded_data.get("translation_audio"):
                     st.audio(st.session_state.recorded_data["translation_audio"])
             
-            # Simple save button
             if st.button("Save Recording", key="save_button"):
                 data = st.session_state.recorded_data
-                
                 db.save_recording(
-                    data["user_id"], 
-                    data["recording_file"], 
-                    data["transcript"], 
-                    data["translation"],
-                    data.get("summary", ""),
-                    data["target_language"],
-                    data.get("translation_audio", None)
+                    data["user_id"], data["recording_file"], data["transcript"], 
+                    data["translation"], data.get("summary", ""), 
+                    data["target_language"], data.get("translation_audio", None)
                 )
                 st.success("Recording saved successfully")
-                # Clear the session state to reset the form
                 st.session_state.recorded_data = None
     
     elif page == "My Recordings":
         st.header("My Recordings")
-        
         user_id = st.text_input("Enter User ID to view recordings", key="user_search_input")
         
         if st.button("Search", key="search_button"):
@@ -443,87 +309,50 @@ def main():
                 st.error("Please enter a User ID")
             else:
                 records = db.get_user_recordings(user_id)
-                
                 if not records:
                     st.warning(f"No recordings found for User ID: {user_id}")
                 else:
                     st.success(f"Found {len(records)} recordings for User ID: {user_id}")
+                    record_data = [{"Recording #": i+1, "Date/Time": r['timestamp'], "Target Language": r.get('target_language', 'English')} for i, r in enumerate(records)]
+                    st.dataframe(pd.DataFrame(record_data), use_container_width=True)
                     
-                    # Create a table for the records
-                    record_data = []
-                    for i, record in enumerate(records):
-                        record_data.append({
-                            "Recording #": i+1,
-                            "Date/Time": record['timestamp'],
-                            "Target Language": record.get('target_language', 'English')
-                        })
-                    
-                    record_df = pd.DataFrame(record_data)
-                    st.dataframe(record_df, use_container_width=True)
-                    
-                    # Detailed view when a record is selected
-                    record_options = [f"Recording {i+1} - {record['timestamp']}" for i, record in enumerate(records)]
-                    selected_record = st.selectbox("Select recording to view details:", 
-                                                  record_options,
-                                                  key="record_select")
+                    record_options = [f"Recording {i+1} - {r['timestamp']}" for i, r in enumerate(records)]
+                    selected_record = st.selectbox("Select recording to view details:", record_options, key="record_select")
                     
                     if selected_record:
                         record_idx = int(selected_record.split(" ")[1]) - 1
                         record = records[record_idx]
-                        
                         st.subheader(f"Recording Details - {record['timestamp']}")
-                        
-                        # Audio playback
                         st.markdown("**Original Recording:**")
                         if os.path.exists(record['recording_path']):
                             st.audio(record['recording_path'])
                         else:
                             st.error(f"Audio file not found: {record['recording_path']}")
                         
-                        # Display in two-column format
-                        target_language = record.get('target_language', 'English')
-                        
-                        # Use columns for side-by-side display
                         col1, col2 = st.columns(2)
-                        
                         with col1:
                             st.markdown("**Original Transcript:**")
                             st.write(record['transcript'])
-                        
                         with col2:
-                            st.markdown(f"**Translation ({target_language}):**")
+                            st.markdown(f"**Translation ({record.get('target_language', 'English')}):**")
                             st.write(record['translation'])
-                        
-                        # Translation audio if available
                         if record.get('translation_audio') and os.path.exists(record['translation_audio']):
-                            st.markdown(f"**Translation Audio:**")
+                            st.markdown("**Translation Audio:**")
                             st.audio(record['translation_audio'])
     
     elif page == "Settings":
         st.header("Settings")
-        
         st.subheader("API Configuration")
-        # Show the API key in the settings (masked for security)
-        api_key = st.text_input("Gemini API Key", 
-                              value="AIzaSyA4XoQocx6O7ffw413LfZkUjd6cFrLozuE", 
-                              type="password",
-                              key="api_key_input")
+        st.write(f"Current API Key Index: {st.session_state.current_api_key_index}")
+        st.write(f"Active API Key: {API_KEYS[st.session_state.current_api_key_index][:10]}... (masked)")
         
-        # Model selection
-        model_version = st.selectbox(
-            "Gemini Model Version",
-            ["gemini-1.5-pro", "gemini-1.0-pro", "gemini-pro-vision"],
-            index=0,
-            key="model_select"
-        )
+        if st.button("Rotate to Next API Key", key="rotate_api_button"):
+            switch_to_next_api_key()
+            st.success(f"Switched to API key index {st.session_state.current_api_key_index}")
         
-        if st.button("Save API Settings", key="save_api_button"):
-            # In production, use a secure method to store this
-            st.success("API Settings saved successfully")
-            
+        model_version = st.selectbox("Gemini Model Version", ["gemini-1.5-pro", "gemini-1.0-pro", "gemini-pro-vision"], index=0, key="model_select")
+        
         st.subheader("System Status")
-        
-        # Display system status in columns
         col1, col2 = st.columns(2)
         with col1:
             st.write("Database Status: Connected")
