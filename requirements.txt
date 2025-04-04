@@ -3,6 +3,5 @@ numpy
 scipy
 pandas
 gtts
-PyAudio
 google-generativeai
 python-dotenv
