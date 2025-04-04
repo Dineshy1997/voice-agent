@@ -8,8 +8,6 @@ import pandas as pd
 from gtts import gTTS
 import tempfile
 from pathlib import Path
-import pyaudio
-import wave
 import json
 import google.generativeai as genai
 
@@ -24,7 +22,7 @@ def configure_gemini_api():
 def initialize_gemini():
     gemini = configure_gemini_api()
     # Using gemini-1.5-pro instead of gemini-pro as it might be the newer version required
-    model = gemini.GenerativeModel('gemini-1.5-pro')
+    model = genai.GenerativeModel('gemini-1.5-pro')
     return model
 
 # System database simulation (in production, use a proper database)
@@ -65,59 +63,8 @@ class RecordingsDatabase:
             return self.records[user_id]
         return []
 
-# Simple function to record audio with manual duration
-def record_audio(duration=10, sample_rate=44100):
-    st.write("🔴 Recording...")
-    progress_bar = st.progress(0)
-    
-    # Initialize PyAudio
-    p = pyaudio.PyAudio()
-    
-    # Open stream
-    stream = p.open(format=pyaudio.paInt16,
-                    channels=1,
-                    rate=sample_rate,
-                    input=True,
-                    frames_per_buffer=1024)
-    
-    frames = []
-    
-    # Record for specified duration
-    for i in range(0, int(sample_rate / 1024 * duration)):
-        data = stream.read(1024)
-        frames.append(data)
-        # Update progress bar
-        progress_bar.progress((i + 1) / int(sample_rate / 1024 * duration))
-        time.sleep(0.001)  # Small sleep to allow UI to update
-    
-    # Stop and close the stream
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
-    
-    # Generate filename based on timestamp
-    filename = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-    
-    # Create directory if it doesn't exist
-    os.makedirs(os.path.dirname(filename), exist_ok=True)
-    
-    # Save recording
-    wf = wave.open(filename, 'wb')
-    wf.setnchannels(1)
-    wf.setsampwidth(p.get_sample_size(pyaudio.paInt16))
-    wf.setframerate(sample_rate)
-    wf.writeframes(b''.join(frames))
-    wf.close()
-    
-    st.success(f"Recording saved: {filename}")
-    return filename
-
-# Transcription and translation using Gemini
-def transcribe_and_translate(model, audio_file, source_language="auto", target_language="English"):
-    # Step 1: Transcribe audio with Gemini
-    with open(audio_file, "rb") as f:
-        audio_data = f.read()
-    
+# Function to transcribe and translate using Gemini
+def transcribe_and_translate(model, audio_data, source_language="auto", target_language="English"):
     # For Gemini, we need to encode the audio file
     import base64
     audio_b64 = base64.b64encode(audio_data).decode()
@@ -251,16 +198,25 @@ def main():
                                        ["English", "Spanish", "French", "Chinese", "Arabic", 
                                         "Hindi", "Japanese", "German", "Portuguese", "Russian"],
                                        key="target_language_select")
-        with col4:
-            duration = st.slider("Recording Duration (seconds)", min_value=5, max_value=60, value=10, key="duration_slider")
         
-        # Recording button
-        if st.button("Start Recording", key="record_button"):
+        # Use File Uploader instead of direct recording
+        uploaded_file = st.file_uploader("Upload audio file (WAV, MP3)", type=["wav", "mp3"])
+        
+        # Process button
+        if st.button("Process Audio", key="process_button") and uploaded_file is not None:
             if not user_id:
                 st.error("Please enter a User ID")
             else:
-                # Record audio
-                recording_file = record_audio(duration=duration)
+                # Save the uploaded file
+                recording_file = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+                os.makedirs(os.path.dirname(recording_file), exist_ok=True)
+                
+                # Read the file data
+                audio_data = uploaded_file.getvalue()
+                
+                # Save file
+                with open(recording_file, "wb") as f:
+                    f.write(audio_data)
                 
                 # Store necessary data in session state
                 st.session_state.recorded_data = {
@@ -274,14 +230,14 @@ def main():
                 with st.spinner("Transcribing and translating..."):
                     transcript, translation = transcribe_and_translate(
                         model, 
-                        recording_file, 
+                        audio_data, 
                         source_language, 
                         target_language
                     )
                     st.session_state.recorded_data["transcript"] = transcript
                     st.session_state.recorded_data["translation"] = translation
                 
-                # Generate summary (but don't display it)
+                # Generate summary
                 with st.spinner("Generating content summary..."):
                     summary = generate_content_summary(model, translation)
                     st.session_state.recorded_data["summary"] = summary
@@ -426,14 +382,6 @@ def main():
             recording_count = sum(len(records) for records in db.records.values())
             st.write(f"Total Recordings: {recording_count}")
             st.write(f"Users in Database: {len(db.records)}")
-        
-        # Audio settings
-        st.subheader("Audio Settings")
-        sample_rate = st.select_slider("Sample Rate", 
-                                     options=[8000, 16000, 22050, 44100, 48000], 
-                                     value=44100,
-                                     key="sample_rate_slider")
-        st.info(f"Using sample rate: {sample_rate}Hz. Higher values provide better quality but use more storage.")
 
 if __name__ == "__main__":
     main()
