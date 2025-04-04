@@ -1,0 +1,10 @@
+# requirements.txt
+streamlit
+speechrecognition
+googletrans
+pyttsx3
+google-generativeai
+pyaudio
+numpy
+python-dotenv
+pydub
