@@ -10,11 +10,16 @@ import tempfile
 from pathlib import Path
 import json
 import google.generativeai as genai
+from streamlit_webrtc import webrtc_streamer, WebRtcMode
+import av
+import queue
+import threading
+import io
 
 # Configure API key
 def configure_gemini_api():
     # Directly use your Gemini API key
-    api_key = "AIzaSyA4XoQocx6O7ffw413LfZkUjd6cFrLozuE"
+    api_key = "AIzaSyAtru-mkkcFaB0iUj_mUieqSs-p5ArAMpME"
     genai.configure(api_key=api_key)
     return genai
 
@@ -156,6 +161,63 @@ def text_to_speech(text, language='en'):
         st.error(f"Text-to-speech error: {str(e)}")
         return None
 
+# WebRTC Audio Recorder
+class AudioProcessor:
+    def __init__(self, max_duration=10):
+        self.sample_rate = 16000
+        self.channels = 1
+        self.audio_frames = []
+        self.start_time = None
+        self.max_duration = max_duration
+        self.recording = False
+        self.recorded_audio = None
+        self.file_path = None
+    
+    def start_recording(self):
+        self.audio_frames = []
+        self.start_time = time.time()
+        self.recording = True
+        
+    def stop_recording(self):
+        self.recording = False
+        
+    def save_recording(self):
+        if not self.audio_frames:
+            return None
+            
+        # Convert to numpy array
+        audio_data = np.concatenate(self.audio_frames)
+        
+        # Save to file
+        filename = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
+        
+        # Write WAV file
+        write(filename, self.sample_rate, audio_data.astype(np.int16))
+        
+        # Save the file path and audio data
+        self.file_path = filename
+        self.recorded_audio = audio_data
+        
+        return filename
+        
+    def process_audio(self, frame):
+        if not self.recording:
+            return frame
+            
+        # Check if max duration reached
+        current_time = time.time()
+        if current_time - self.start_time > self.max_duration:
+            self.stop_recording()
+            return frame
+            
+        # Process audio frame
+        audio_frame = frame.to_ndarray()
+        audio_data = audio_frame.flatten()
+        self.audio_frames.append(audio_data)
+        
+        return frame
+
 # Main Streamlit app
 def main():
     st.title("Cube AI Voice Assistant")
@@ -166,6 +228,9 @@ def main():
     # Initialize session state for recording data
     if 'recorded_data' not in st.session_state:
         st.session_state.recorded_data = None
+    
+    if 'audio_processor' not in st.session_state:
+        st.session_state.audio_processor = AudioProcessor()
     
     # Try to initialize Gemini with error handling
     try:
@@ -188,64 +253,151 @@ def main():
             user_id = st.text_input("User ID", key="user_id_input")
         with col2:
             source_language = st.selectbox("Source Language (if known)", 
-                                       ["auto", "English", "Spanish", "French", "Chinese", "Arabic", 
-                                        "Hindi", "Japanese", "German", "Portuguese", "Russian"],
-                                       key="source_language_select")
+                                      ["auto", "English", "Spanish", "French", "Chinese", "Arabic", 
+                                       "Hindi", "Japanese", "German", "Portuguese", "Russian"],
+                                      key="source_language_select")
         
         col3, col4 = st.columns(2)
         with col3:
             target_language = st.selectbox("Target Language", 
-                                       ["English", "Spanish", "French", "Chinese", "Arabic", 
-                                        "Hindi", "Japanese", "German", "Portuguese", "Russian"],
-                                       key="target_language_select")
+                                      ["English", "Spanish", "French", "Chinese", "Arabic", 
+                                       "Hindi", "Japanese", "German", "Portuguese", "Russian"],
+                                      key="target_language_select")
+        with col4:
+            duration = st.slider("Recording Duration (seconds)", min_value=5, max_value=60, value=10, key="duration_slider")
         
-        # Use File Uploader instead of direct recording
-        uploaded_file = st.file_uploader("Upload audio file (WAV, MP3)", type=["wav", "mp3"])
+        # Tab for recording method selection
+        record_tab, upload_tab = st.tabs(["Record with Microphone", "Upload Audio File"])
         
-        # Process button
-        if st.button("Process Audio", key="process_button") and uploaded_file is not None:
-            if not user_id:
-                st.error("Please enter a User ID")
-            else:
-                # Save the uploaded file
-                recording_file = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
-                os.makedirs(os.path.dirname(recording_file), exist_ok=True)
+        with record_tab:
+            st.session_state.audio_processor.max_duration = duration
+            
+            # Start/Stop recording buttons
+            col_rec1, col_rec2 = st.columns(2)
+            with col_rec1:
+                if st.button("Start Recording", key="start_rec_button"):
+                    st.session_state.audio_processor.start_recording()
+                    st.session_state["recording"] = True
+                    st.info("🎤 Recording... (Speak now)")
+            
+            with col_rec2:
+                if st.button("Stop Recording", key="stop_rec_button"):
+                    st.session_state.audio_processor.stop_recording()
+                    if st.session_state.get("recording", False):
+                        st.session_state["recording"] = False
+                        recording_file = st.session_state.audio_processor.save_recording()
+                        if recording_file:
+                            st.success(f"Recording saved: {recording_file}")
+                            
+                            # Read audio data for processing
+                            with open(recording_file, "rb") as f:
+                                audio_data = f.read()
+                            
+                            if not user_id:
+                                st.error("Please enter a User ID")
+                            else:
+                                # Store necessary data in session state
+                                st.session_state.recorded_data = {
+                                    "user_id": user_id,
+                                    "recording_file": recording_file,
+                                    "source_language": source_language,
+                                    "target_language": target_language
+                                }
+                                
+                                # Process the recording
+                                with st.spinner("Transcribing and translating..."):
+                                    transcript, translation = transcribe_and_translate(
+                                        model, 
+                                        audio_data, 
+                                        source_language, 
+                                        target_language
+                                    )
+                                    st.session_state.recorded_data["transcript"] = transcript
+                                    st.session_state.recorded_data["translation"] = translation
+                                
+                                # Generate summary
+                                with st.spinner("Generating content summary..."):
+                                    summary = generate_content_summary(model, translation)
+                                    st.session_state.recorded_data["summary"] = summary
+                                
+                                # Generate text-to-speech for the translation
+                                with st.spinner("Generating audio for translation..."):
+                                    translation_audio = text_to_speech(translation, target_language)
+                                    st.session_state.recorded_data["translation_audio"] = translation_audio
+            
+            # WebRTC component for audio capture
+            st.markdown("### Microphone Capture")
+            webrtc_ctx = webrtc_streamer(
+                key="sendonly-audio", 
+                mode=WebRtcMode.SENDONLY,
+                audio_receiver_size=1024,
+                media_stream_constraints={"audio": True},
+            )
+            
+            if webrtc_ctx.audio_receiver:
+                audio_frames = []
+                start_time = time.time()
                 
-                # Read the file data
-                audio_data = uploaded_file.getvalue()
+                while time.time() - start_time < 1:  # Check for 1 second to get audio frames
+                    try:
+                        audio_frames.append(webrtc_ctx.audio_receiver.get_frame())
+                    except queue.Empty:
+                        pass
                 
-                # Save file
-                with open(recording_file, "wb") as f:
-                    f.write(audio_data)
-                
-                # Store necessary data in session state
-                st.session_state.recorded_data = {
-                    "user_id": user_id,
-                    "recording_file": recording_file,
-                    "source_language": source_language,
-                    "target_language": target_language
-                }
-                
-                # Process the recording
-                with st.spinner("Transcribing and translating..."):
-                    transcript, translation = transcribe_and_translate(
-                        model, 
-                        audio_data, 
-                        source_language, 
-                        target_language
-                    )
-                    st.session_state.recorded_data["transcript"] = transcript
-                    st.session_state.recorded_data["translation"] = translation
-                
-                # Generate summary
-                with st.spinner("Generating content summary..."):
-                    summary = generate_content_summary(model, translation)
-                    st.session_state.recorded_data["summary"] = summary
-                
-                # Generate text-to-speech for the translation
-                with st.spinner("Generating audio for translation..."):
-                    translation_audio = text_to_speech(translation, target_language)
-                    st.session_state.recorded_data["translation_audio"] = translation_audio
+                if audio_frames and st.session_state.get("recording", False):
+                    for audio_frame in audio_frames:
+                        sound = audio_frame.to_ndarray()
+                        sound = sound.flatten()
+                        st.session_state.audio_processor.audio_frames.append(sound)
+        
+        with upload_tab:
+            # Use File Uploader as an alternative
+            uploaded_file = st.file_uploader("Upload audio file (WAV, MP3)", type=["wav", "mp3"])
+            
+            # Process button
+            if st.button("Process Uploaded Audio", key="process_upload_button") and uploaded_file is not None:
+                if not user_id:
+                    st.error("Please enter a User ID")
+                else:
+                    # Save the uploaded file
+                    recording_file = f"recordings/recording_{datetime.now().strftime('%Y%m%d_%H%M%S')}.wav"
+                    os.makedirs(os.path.dirname(recording_file), exist_ok=True)
+                    
+                    # Read the file data
+                    audio_data = uploaded_file.getvalue()
+                    
+                    # Save file
+                    with open(recording_file, "wb") as f:
+                        f.write(audio_data)
+                    
+                    # Store necessary data in session state
+                    st.session_state.recorded_data = {
+                        "user_id": user_id,
+                        "recording_file": recording_file,
+                        "source_language": source_language,
+                        "target_language": target_language
+                    }
+                    
+                    # Process the recording
+                    with st.spinner("Transcribing and translating..."):
+                        transcript, translation = transcribe_and_translate(
+                            model, 
+                            audio_data, 
+                            source_language, 
+                            target_language
+                        )
+                        st.session_state.recorded_data["transcript"] = transcript
+                        st.session_state.recorded_data["translation"] = translation
+                    
+                    # Generate summary
+                    with st.spinner("Generating content summary..."):
+                        summary = generate_content_summary(model, translation)
+                        st.session_state.recorded_data["summary"] = summary
+                    
+                    # Generate text-to-speech for the translation
+                    with st.spinner("Generating audio for translation..."):
+                        translation_audio = text_to_speech(translation, target_language)
+                        st.session_state.recorded_data["translation_audio"] = translation_audio
         
         # Display recorded data if available in simplified two-column layout
         if st.session_state.get('recorded_data'):
