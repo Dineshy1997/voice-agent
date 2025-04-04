@@ -1,8 +1,6 @@
 streamlit
-numpy
-scipy
-pandas
-gtts
 pyaudio
+scipy
+gtts
+pandas
 google-generativeai
-python-dotenv
