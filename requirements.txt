@@ -3,6 +3,6 @@ numpy
 scipy
 pandas
 gtts
+pyaudio
 google-generativeai
 python-dotenv
-streamlit-webrtc
