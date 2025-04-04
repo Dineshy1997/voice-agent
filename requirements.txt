@@ -5,3 +5,4 @@ pandas
 gtts
 google-generativeai
 python-dotenv
+streamlit-webrtc
