@@ -5,5 +5,3 @@ pandas
 gtts
 google-generativeai
 python-dotenv
-PyAudio
-
